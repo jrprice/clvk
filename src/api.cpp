@@ -176,6 +176,8 @@ void* cvk_get_extension_function_pointer(const char* funcname) {
         return gExtensionEntrypoints.at(funcname);
     } else {
         return nullptr;
+        
+        
     }
 }
 
