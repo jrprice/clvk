@@ -162,8 +162,7 @@ void cvk_device::construct_extension_string() {
     m_extensions += "cl_khr_il_program ";
 }
 
-bool cvk_device::create_vulkan_queues_and_device(uint32_t num_queues,
-                                                 uint32_t queue_family) {
+bool cvk_device::create_vulkan_queues_and_device(uint32_t num_queues, uint32_t queue_family) {
     // Give all queues the same priority
     std::vector<float> queuePriorities(num_queues, 1.0f);
 
@@ -253,8 +252,7 @@ void cvk_device::log_limits_and_memory_information() {
         auto heapsize = m_mem_properties.memoryHeaps[memtype.heapIndex].size;
         cvk_info_fn(
             "    %u: heap = %u, %s | %s", i, memtype.heapIndex,
-            pretty_size(heapsize).c_str(),
-            vulkan_memory_property_flags_string(memtype.propertyFlags).c_str());
+            pretty_size(heapsize).c_str(), vulkan_memory_property_flags_string(memtype.propertyFlags).c_str());
     }
 
     cvk_info_fn("device has %u memory heaps:",
@@ -297,9 +295,9 @@ bool cvk_device::init() {
 
 bool cvk_device::supports_capability(spv::Capability capability) const {
     switch (capability) {
-    // Capabilities required by all Vulkan implementations:
-    case spv::CapabilityShader:
-        return true;
+        // Capabilities required by all Vulkan implementations:
+        case spv::CapabilityShader:
+            return true;
     // Optional capabilities:
     case spv::CapabilityFloat16:
         return m_features_float16_int8.shaderFloat16;
