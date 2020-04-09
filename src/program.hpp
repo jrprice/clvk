@@ -209,11 +209,15 @@ public:
 
     uint32_t num_set_layouts() const { return m_descriptor_set_layouts.size(); }
 
-    std::unique_ptr<cvk_buffer> allocate_pod_buffer();
+    cvk_buffer* pod_buffer() const { return m_pod_buffer.get(); }
+
+    uint32_t pod_buffer_size() const { return m_pod_buffer_size; }
 
     const std::vector<kernel_argument>& args() const { return m_args; }
 
     bool has_pod_arguments() const { return m_has_pod_arguments; }
+
+    const kernel_argument* pod_arg() const { return m_pod_arg; }
 
     uint32_t num_resources() const { return m_num_resources; }
 
@@ -222,6 +226,10 @@ public:
     VkDescriptorType pod_descriptor_type() const {
         return m_pod_descriptor_type;
     }
+
+    uint32_t acquire_instance_id();
+
+    void release_instance_id(uint32_t id);
 
 private:
     const uint32_t MAX_INSTANCES = 16 * 1024; // FIXME find a better definition
@@ -233,12 +241,18 @@ private:
     VkDescriptorType m_pod_descriptor_type;
     uint32_t m_pod_buffer_size;
     bool m_has_pod_arguments;
+    const kernel_argument* m_pod_arg;
+    std::unique_ptr<cvk_buffer> m_pod_buffer;
     std::vector<kernel_argument> m_args;
     uint32_t m_num_resources;
     VkDescriptorPool m_descriptor_pool;
     std::vector<VkDescriptorSetLayout> m_descriptor_set_layouts;
     VkPipelineLayout m_pipeline_layout;
     VkPipelineCache m_pipeline_cache;
+
+    uint32_t m_next_instance_id;
+    std::list<uint32_t> m_instance_id_pool;
+    std::mutex m_instance_id_lock;
 
     std::mutex m_pipeline_cache_lock;
     std::mutex m_descriptor_pool_lock;

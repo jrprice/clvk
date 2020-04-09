@@ -27,7 +27,7 @@ struct cvk_kernel : public _cl_kernel, api_object {
 
     cvk_kernel(cvk_program* program, const char* name)
         : api_object(program->context()), m_program(program),
-          m_entry_point(nullptr), m_name(name), m_pod_arg(nullptr) {
+          m_entry_point(nullptr), m_name(name) {
         m_program->retain();
     }
 
@@ -35,17 +35,11 @@ struct cvk_kernel : public _cl_kernel, api_object {
 
     virtual ~cvk_kernel() { m_program->release(); }
 
-    CHECK_RETURN bool setup_descriptor_sets(
-        VkDescriptorSet* ds,
-        std::unique_ptr<cvk_kernel_argument_values>& arg_values);
-
-    void free_descriptor_set(VkDescriptorSet ds) {
-        m_entry_point->free_descriptor_set(ds);
-    }
-
     CHECK_RETURN cl_int set_arg(cl_uint index, size_t size, const void* value);
     CHECK_RETURN VkPipeline
     create_pipeline(const cvk_spec_constant_map& spec_constants);
+
+    cvk_entry_point* entry_point() { return m_entry_point; }
 
     bool has_pod_arguments() const {
         return m_entry_point->has_pod_arguments();
@@ -64,17 +58,19 @@ struct cvk_kernel : public _cl_kernel, api_object {
         return m_args[index].kind;
     }
 
+    const cvk_kernel_argument_values& arg_values() const {
+        return *m_argument_values.get();
+    }
+
     cl_ulong local_mem_size() const;
 
 private:
-    std::unique_ptr<cvk_buffer> allocate_pod_buffer();
     friend cvk_kernel_argument_values;
 
     std::mutex m_lock;
     cvk_program* m_program;
     cvk_entry_point* m_entry_point;
     std::string m_name;
-    const kernel_argument* m_pod_arg;
     std::vector<kernel_argument> m_args;
     std::unique_ptr<cvk_kernel_argument_values> m_argument_values;
 };
@@ -88,14 +84,9 @@ using cvk_kernel_holder = refcounted_holder<cvk_kernel>;
 struct cvk_kernel_argument_values {
 
     cvk_kernel_argument_values(cvk_kernel* kernel, uint32_t num_resources)
-        : m_kernel(kernel), m_pod_buffer(nullptr), m_owns_resources(false),
+        : m_kernel(kernel), m_owns_resources(false),
           m_kernel_resources(num_resources),
           m_local_args_size(m_kernel->num_args(), 0) {}
-
-    cvk_kernel_argument_values(const cvk_kernel_argument_values& other)
-        : m_kernel(other.m_kernel), m_pod_buffer(nullptr),
-          m_owns_resources(false), m_kernel_resources(other.m_kernel_resources),
-          m_local_args_size(other.m_local_args_size) {}
 
     ~cvk_kernel_argument_values() { release_resources(); }
 
@@ -112,40 +103,16 @@ struct cvk_kernel_argument_values {
     }
 
     static std::unique_ptr<cvk_kernel_argument_values>
-    create(const cvk_kernel_argument_values& other) {
-        auto val = std::make_unique<cvk_kernel_argument_values>(other);
-
-        if (!val->init()) {
-            return nullptr;
-        }
-
-        if (!val->init_copy(other)) {
-            return nullptr;
-        }
-
-        return val;
+    clone(const cvk_kernel_argument_values& other) {
+        return std::make_unique<cvk_kernel_argument_values>(other);
     }
 
     bool init() {
         if (m_kernel->has_pod_arguments()) {
-            auto buffer = m_kernel->allocate_pod_buffer();
-            if (buffer == nullptr) {
-                return false;
-            }
-
-            m_pod_buffer = std::move(buffer);
+            m_pod_data.resize(m_kernel->entry_point()->pod_buffer_size());
         }
 
         return true;
-    }
-
-    bool init_copy(const cvk_kernel_argument_values& other) {
-        if (m_kernel->has_pod_arguments()) {
-            return other.m_pod_buffer->copy_to(m_pod_buffer.get(), 0, 0,
-                                               m_pod_buffer->size());
-        } else {
-            return true;
-        }
     }
 
     cl_int set_arg(const kernel_argument& arg, size_t size, const void* value) {
@@ -155,9 +122,7 @@ struct cvk_kernel_argument_values {
                 return CL_INVALID_ARG_SIZE;
             }
 
-            if (!m_pod_buffer->copy_from(value, arg.offset, size)) {
-                return CL_OUT_OF_RESOURCES;
-            }
+            std::memcpy(m_pod_data.data() + arg.offset, value, size);
         } else if (arg.kind == kernel_argument_kind::local) {
             CVK_ASSERT(value == nullptr);
             m_local_args_size[arg.pos] = size;
@@ -185,7 +150,7 @@ struct cvk_kernel_argument_values {
         return m_kernel_resources[arg.binding];
     }
 
-    VkBuffer pod_vulkan_buffer() const { return m_pod_buffer->vulkan_buffer(); }
+    const std::vector<uint8_t>& pod_data() const { return m_pod_data; }
 
     size_t local_arg_size(int pos) const { return m_local_args_size[pos]; }
 
@@ -217,7 +182,7 @@ struct cvk_kernel_argument_values {
 
 private:
     cvk_kernel* m_kernel;
-    std::unique_ptr<cvk_buffer> m_pod_buffer;
+    std::vector<uint8_t> m_pod_data;
     bool m_owns_resources;
     std::vector<refcounted*> m_kernel_resources;
     std::vector<size_t> m_local_args_size;

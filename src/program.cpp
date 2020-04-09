@@ -1117,7 +1117,7 @@ cvk_entry_point::cvk_entry_point(VkDevice dev, cvk_program* program,
       m_name(name), m_pod_descriptor_type(VK_DESCRIPTOR_TYPE_MAX_ENUM),
       m_pod_buffer_size(0u), m_has_pod_arguments(false),
       m_descriptor_pool(VK_NULL_HANDLE), m_pipeline_layout(VK_NULL_HANDLE),
-      m_pipeline_cache(VK_NULL_HANDLE) {}
+      m_pipeline_cache(VK_NULL_HANDLE), m_next_instance_id(0u) {}
 
 cvk_entry_point* cvk_program::get_entry_point(std::string& name,
                                               cl_int* errcode_ret) {
@@ -1288,6 +1288,7 @@ cl_int cvk_entry_point::init() {
     for (auto& arg : m_args) {
         if (arg.is_pod()) {
             m_has_pod_arguments = true;
+            m_pod_arg = &arg;
         }
     }
 
@@ -1310,6 +1311,22 @@ cl_int cvk_entry_point::init() {
         }
 
         m_pod_buffer_size = max_offset + max_offset_arg_size;
+
+        // Pad size to match required UBO offset alignment
+        VkDeviceSize alignment = m_context->device()
+                                     ->vulkan_limits()
+                                     .minUniformBufferOffsetAlignment;
+        m_pod_buffer_size =
+            ((m_pod_buffer_size + alignment - 1) / alignment) * alignment;
+
+        // Create a buffer to hold POD args for MAX_INSTANCES kernel instances
+        cl_int errcode;
+        m_pod_buffer = cvk_buffer::create(
+            m_context, 0, m_pod_buffer_size * MAX_INSTANCES, nullptr, &errcode);
+        if (errcode != CL_SUCCESS) {
+            cvk_error("Failed to allocate POD buffer: %d", errcode);
+            return errcode;
+        }
     }
 
     // Create pipeline layout
@@ -1474,13 +1491,29 @@ bool cvk_entry_point::allocate_descriptor_sets(VkDescriptorSet* ds) {
     return true;
 }
 
-std::unique_ptr<cvk_buffer> cvk_entry_point::allocate_pod_buffer() {
-    cl_int err;
-    auto buffer =
-        cvk_buffer::create(m_context, 0, m_pod_buffer_size, nullptr, &err);
-    if (err != CL_SUCCESS) {
-        return nullptr;
-    }
+uint32_t cvk_entry_point::acquire_instance_id() {
+    std::lock_guard<std::mutex> lock(m_instance_id_lock);
 
-    return buffer;
+    // Check pool for available IDs, otherwise allocate a new one
+    uint32_t id;
+    if (!m_instance_id_pool.empty()) {
+        id = m_instance_id_pool.front();
+        m_instance_id_pool.pop_front();
+    } else {
+        if (m_next_instance_id >= MAX_INSTANCES) {
+            cvk_error("exceeded MAX_INSTANCES (%d) instances for kernel %s",
+                      MAX_INSTANCES, m_name.c_str());
+            return UINT32_MAX;
+        }
+        id = m_next_instance_id++;
+    }
+    return id;
+}
+
+void cvk_entry_point::release_instance_id(uint32_t id) {
+    std::lock_guard<std::mutex> lock(m_instance_id_lock);
+    if (id != UINT32_MAX) {
+        // Return instance ID to pool
+        m_instance_id_pool.push_front(id);
+    }
 }

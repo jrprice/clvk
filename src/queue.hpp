@@ -580,12 +580,14 @@ struct cvk_command_kernel : public cvk_command {
           m_num_wg(num_wg), m_wg_size(wg_size),
           m_command_buffer(q), m_descriptor_sets{VK_NULL_HANDLE},
           m_pipeline(VK_NULL_HANDLE), m_query_pool(VK_NULL_HANDLE),
-          m_argument_values(nullptr) {}
+          m_argument_values(nullptr), m_instance_id(UINT32_MAX) {}
 
     ~cvk_command_kernel() {
+        m_kernel->entry_point()->release_instance_id(m_instance_id);
+
         for (auto ds : m_descriptor_sets) {
             if (ds != VK_NULL_HANDLE) {
-                m_kernel->free_descriptor_set(ds);
+                m_kernel->entry_point()->free_descriptor_set(ds);
             }
         }
 
@@ -594,6 +596,8 @@ struct cvk_command_kernel : public cvk_command {
             vkDestroyQueryPool(vkdev, m_query_pool, nullptr);
         }
     }
+
+    CHECK_RETURN bool setup_descriptor_sets();
 
     bool is_profiled_by_executor() const override {
         return !gQueueProfilingUsesTimestampQueries;
@@ -614,6 +618,7 @@ private:
     VkPipeline m_pipeline;
     VkQueryPool m_query_pool;
     std::unique_ptr<cvk_kernel_argument_values> m_argument_values;
+    uint32_t m_instance_id;
 
     static const int NUM_POOL_QUERIES_PER_KERNEL = 2;
     static const int POOL_QUERY_KERNEL_START = 0;

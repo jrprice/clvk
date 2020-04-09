@@ -318,9 +318,24 @@ cl_int cvk_command_kernel::build() {
     // TODO CL_INVALID_KERNEL_ARGS if the kernel argument values have not been
     // specified.
 
+    // Create a copy of the kernel argument values
+    m_argument_values =
+        cvk_kernel_argument_values::clone(m_kernel->arg_values());
+    if (m_argument_values == nullptr) {
+        return false;
+    }
+    m_argument_values->retain_resources();
+
+    auto entry_point = m_kernel->entry_point();
+
+    // Get an instance ID
+    m_instance_id = entry_point->acquire_instance_id();
+    if (m_instance_id == UINT32_MAX) {
+        return CL_OUT_OF_RESOURCES;
+    }
+
     // Setup descriptors
-    if (!m_kernel->setup_descriptor_sets(m_descriptor_sets.data(),
-                                         m_argument_values)) {
+    if (!setup_descriptor_sets()) {
         return CL_OUT_OF_RESOURCES;
     }
 
@@ -385,6 +400,38 @@ cl_int cvk_command_kernel::build() {
 
     auto program = m_kernel->program();
 
+    if (entry_point->has_pod_arguments()) {
+        uint32_t pod_size = entry_point->pod_buffer_size();
+        uint32_t pod_offset = pod_size * m_instance_id;
+
+        // Write POD data to our chunk of the UBO
+        vkCmdUpdateBuffer(
+            m_command_buffer, entry_point->pod_buffer()->vulkan_buffer(),
+            pod_offset, pod_size, m_argument_values->pod_data().data());
+
+        // Synchronize the POD data transfer with the compute shader
+        VkBufferMemoryBarrier pod_ubo_barrier = {
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            nullptr,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_UNIFORM_READ_BIT,
+            m_queue->vulkan_queue().queue_family(),
+            m_queue->vulkan_queue().queue_family(),
+            entry_point->pod_buffer()->vulkan_buffer(),
+            pod_offset,
+            pod_size,
+        };
+        vkCmdPipelineBarrier(m_command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0,                // dependencyFlags
+                             0,                // memoryBarrierCount
+                             nullptr,          // pMemoryBarriers
+                             1,                // bufferMemoryBarrierCount
+                             &pod_ubo_barrier, // pBufferMemoryBarriers
+                             0,                // imageMemoryBarrierCount
+                             nullptr);         // pImageMemoryBarriers
+    }
+
     if (auto pc = program->push_constant(pushconstant::dimensions)) {
         CVK_ASSERT(pc->size == 4);
         vkCmdPushConstants(m_command_buffer, m_kernel->pipeline_layout(),
@@ -426,6 +473,174 @@ cl_int cvk_command_kernel::build() {
     }
 
     return CL_SUCCESS;
+}
+
+bool cvk_command_kernel::setup_descriptor_sets() {
+
+    auto entry_point = m_kernel->entry_point();
+    auto program = m_kernel->program();
+
+    if (!entry_point->allocate_descriptor_sets(m_descriptor_sets.data())) {
+        return program;
+    }
+
+    auto dev = program->context()->device()->vulkan_device();
+
+    // Setup descriptors for POD arguments
+    if (entry_point->has_pod_arguments()) {
+        auto pod_arg = entry_point->pod_arg();
+        uint32_t pod_size = entry_point->pod_buffer_size();
+        uint32_t pod_offset = pod_size * m_instance_id;
+
+        // Update desciptors
+        VkDescriptorBufferInfo bufferInfo = {
+            entry_point->pod_buffer()->vulkan_buffer(), pod_offset, pod_size};
+
+        VkWriteDescriptorSet writeDescriptorSet = {
+            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            nullptr,
+            m_descriptor_sets[pod_arg->descriptorSet],
+            pod_arg->binding,                   // dstBinding
+            0,                                  // dstArrayElement
+            1,                                  // descriptorCount
+            entry_point->pod_descriptor_type(), // descriptorType
+            nullptr,                            // pImageInfo
+            &bufferInfo,
+            nullptr, // pTexelBufferView
+        };
+        vkUpdateDescriptorSets(dev, 1, &writeDescriptorSet, 0, nullptr);
+    }
+
+    // Setup other kernel argument descriptors
+    for (cl_uint i = 0; i < entry_point->args().size(); i++) {
+        auto const& arg = entry_point->args()[i];
+
+        switch (arg.kind) {
+
+        case kernel_argument_kind::buffer:
+        case kernel_argument_kind::buffer_ubo: {
+            auto buffer =
+                static_cast<cvk_buffer*>(m_argument_values->get_arg_value(arg));
+            auto vkbuf = buffer->vulkan_buffer();
+            cvk_debug_fn("buffer = %p", buffer);
+            VkDescriptorBufferInfo bufferInfo = {
+                vkbuf,
+                buffer->vulkan_buffer_offset(), // offset
+                buffer->size()};
+
+            auto descriptor_type = arg.kind == kernel_argument_kind::buffer
+                                       ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                       : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            VkWriteDescriptorSet writeDescriptorSet = {
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                nullptr,
+                m_descriptor_sets[arg.descriptorSet],
+                arg.binding, // dstBinding
+                0,           // dstArrayElement
+                1,           // descriptorCount
+                descriptor_type,
+                nullptr, // pImageInfo
+                &bufferInfo,
+                nullptr, // pTexelBufferView
+            };
+            vkUpdateDescriptorSets(dev, 1, &writeDescriptorSet, 0, nullptr);
+            break;
+        }
+        case kernel_argument_kind::sampler: {
+            auto clsampler = static_cast<cvk_sampler*>(
+                m_argument_values->get_arg_value(arg));
+            auto sampler = clsampler->vulkan_sampler();
+
+            VkDescriptorImageInfo imageInfo = {
+                sampler,
+                VK_NULL_HANDLE,           // imageView
+                VK_IMAGE_LAYOUT_UNDEFINED // imageLayout
+            };
+
+            VkWriteDescriptorSet writeDescriptorSet = {
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                nullptr,
+                m_descriptor_sets[arg.descriptorSet],
+                arg.binding, // dstBinding
+                0,           // dstArrayElement
+                1,           // descriptorCount
+                VK_DESCRIPTOR_TYPE_SAMPLER,
+                &imageInfo, // pImageInfo
+                nullptr,    // pBufferInfo
+                nullptr,    // pTexelBufferView
+            };
+            vkUpdateDescriptorSets(dev, 1, &writeDescriptorSet, 0, nullptr);
+            break;
+        }
+        case kernel_argument_kind::ro_image:
+        case kernel_argument_kind::wo_image: {
+            auto image =
+                static_cast<cvk_image*>(m_argument_values->get_arg_value(arg));
+
+            VkDescriptorImageInfo imageInfo = {
+                VK_NULL_HANDLE,
+                image->vulkan_image_view(), // imageView
+                VK_IMAGE_LAYOUT_GENERAL     // imageLayout
+            };
+
+            VkDescriptorType dtype = arg.kind == kernel_argument_kind::ro_image
+                                         ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+                                         : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+
+            VkWriteDescriptorSet writeDescriptorSet = {
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                nullptr,
+                m_descriptor_sets[arg.descriptorSet],
+                arg.binding, // dstBinding
+                0,           // dstArrayElement
+                1,           // descriptorCount
+                dtype,
+                &imageInfo, // pImageInfo
+                nullptr,    // pBufferInfo
+                nullptr,    // pTexelBufferView
+            };
+            vkUpdateDescriptorSets(dev, 1, &writeDescriptorSet, 0, nullptr);
+            break;
+        }
+        case kernel_argument_kind::pod: // skip POD arguments
+        case kernel_argument_kind::pod_ubo:
+            break;
+        case kernel_argument_kind::local: // nothing to do?
+            break;
+        default:
+            cvk_error_fn("unsupported argument type");
+            return false;
+        }
+    }
+
+    // Setup literal samplers
+    for (size_t i = 0; i < program->literal_sampler_descs().size(); i++) {
+        auto desc = program->literal_sampler_descs()[i];
+        auto clsampler = icd_downcast(program->literal_samplers()[i]);
+        auto sampler = clsampler->vulkan_sampler();
+
+        VkDescriptorImageInfo imageInfo = {
+            sampler,
+            VK_NULL_HANDLE,           // imageView
+            VK_IMAGE_LAYOUT_UNDEFINED // imageLayout
+        };
+
+        VkWriteDescriptorSet writeDescriptorSet = {
+            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            nullptr,
+            m_descriptor_sets[desc.descriptorSet],
+            desc.binding, // dstBinding
+            0,            // dstArrayElement
+            1,            // descriptorCount
+            VK_DESCRIPTOR_TYPE_SAMPLER,
+            &imageInfo, // pImageInfo
+            nullptr,    // pBufferInfo
+            nullptr,    // pTexelBufferView
+        };
+        vkUpdateDescriptorSets(dev, 1, &writeDescriptorSet, 0, nullptr);
+    }
+
+    return true;
 }
 
 cl_int cvk_command_kernel::do_action() {
@@ -616,8 +831,8 @@ cl_int cvk_command_copy_buffer::do_action() {
 }
 
 namespace {
-template<typename T>
-void memset_multi(void *dst, void *pattern_ptr, size_t size) {
+template <typename T>
+void memset_multi(void* dst, void* pattern_ptr, size_t size) {
     T pattern = *static_cast<T*>(pattern_ptr);
     auto end = pointer_offset(dst, size);
     while (dst < end) {
@@ -625,7 +840,7 @@ void memset_multi(void *dst, void *pattern_ptr, size_t size) {
         dst = pointer_offset(dst, sizeof(pattern));
     }
 }
-}
+} // namespace
 
 cl_int cvk_command_fill_buffer::do_action() {
     memobj_map_holder map_holder{m_buffer};
